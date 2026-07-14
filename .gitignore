@@ -1,0 +1,18 @@
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+admin_sdk.json
+firebase.json
+service-account*.json
+
+# Build output
+node_modules/
+package/dist/app.js
+*.ehpk
+.next/
+
+# OS / editor
+.DS_Store
+*.log

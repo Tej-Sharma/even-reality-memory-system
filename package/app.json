@@ -1,0 +1,29 @@
+{
+  "package_id": "com.constella.glasses",
+  "edition": "202601",
+  "name": "Constella",
+  "version": "1.0.2",
+  "min_app_version": "2.0.0",
+  "min_sdk_version": "0.0.11",
+  "entrypoint": "index.html",
+  "permissions": [
+    {
+      "name": "network",
+      "desc": "Connects to the Constella API to log in, transcribe meetings, query your memory, and save notes.",
+      "whitelist": [
+        "https://fastfind.app",
+        "https://constella.app",
+        "https://www.constella.app"
+      ]
+    },
+    {
+      "name": "g2-microphone",
+      "desc": "Captures your voice on the glasses so you can ask questions, dictate notes, and transcribe meetings."
+    },
+    {
+      "name": "phone-microphone",
+      "desc": "Fallback voice capture through the phone microphone."
+    }
+  ],
+  "supported_languages": ["en"]
+}
