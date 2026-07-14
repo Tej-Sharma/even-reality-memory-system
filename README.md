@@ -2,11 +2,11 @@
 
 An open-source **AI memory system for [Even Realities G2](https://www.evenrealities.com/) smart glasses**. Talk to your glasses to capture thoughts, ask your own knowledge base out loud, and turn whole meetings into searchable memory — with live AI insights on the lens as you speak.
 
+<img width="576" height="288" alt="3-recall-answer" src="https://github.com/user-attachments/assets/da76ff2e-39c7-4680-bd91-bf0cf2ee2b81" />
+
+
 No phone in your hand. Just say it, and it's remembered. Ask, and it answers.
 
-<p align="center">
-  <img src="docs/images/home.png" width="420" alt="Constella home screen on the Even G2 lens">
-</p>
 
 > Built on top of [Constella](https://constella.app), an open knowledge base. This repo is the glasses integration extracted on its own so you can see exactly how it works and build your own.
 
