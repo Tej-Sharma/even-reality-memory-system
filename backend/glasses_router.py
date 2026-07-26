@@ -304,6 +304,28 @@ def _verify_and_link(user_code: str, email: str, code: str) -> Dict[str, Any]:
 	}
 
 
+def _transcribe_wav_local(wav: bytes) -> str:
+	"""Transcribe a WAV buffer on our own GPU via the local whisper-server.
+
+	Primary path: free (no per-call API cost), low latency (no cloud roundtrip),
+	and immune to the OpenAI quota running dry. Sends the WAV as base64 to the
+	internal whisper-server with the shared internal API key. Raises on any
+	failure so `_transcribe_pcm` cleanly falls back to OpenAI/Deepgram.
+	"""
+	base_url = os.getenv("WHISPER_SERVER_URL")
+	if not base_url or os.getenv("USE_WHISPER_SERVER", "true").strip().lower() not in {"1", "true", "yes", "on"}:
+		raise RuntimeError("whisper-server disabled")
+	api_key = os.getenv("WHISPER_SERVER_API_KEY") or os.getenv("EMBEDDING_SERVER_API_KEY") or ""
+	resp = requests.post(
+		f"{base_url.rstrip('/')}/transcribe",
+		headers={"x-whisper-api-key": api_key, "Content-Type": "application/json"},
+		json={"audio_base64": base64.b64encode(wav).decode("ascii"), "language": "en"},
+		timeout=30,
+	)
+	resp.raise_for_status()
+	return (resp.json().get("text") or "").strip()
+
+
 def _transcribe_wav_deepgram(wav: bytes) -> str:
 	"""Transcribe a WAV buffer with Deepgram's prerecorded API (nova-2).
 
@@ -349,6 +371,14 @@ def _transcribe_pcm(pcm_b64: str, sample_rate: int = 16000) -> str:
 	wav = _pcm_to_wav(pcm_bytes, sample_rate=sample_rate)
 
 	errors: List[str] = []
+	# Primary: our own GPU whisper-server (free, low-latency, quota-proof).
+	try:
+		text = _transcribe_wav_local(wav)
+		return text
+	except Exception as e:
+		errors.append(f"local: {type(e).__name__}")
+		logger.warning("[glasses] local whisper-server failed, trying OpenAI: %s", e)
+
 	try:
 		bio = io.BytesIO(wav)
 		bio.name = "audio.wav"  # OpenAI SDK infers format from the filename
@@ -661,6 +691,7 @@ class MeetingEndReq(BaseModel):
 	# Optional final flush: the last partial chunk of audio recorded before end.
 	pcm_base64: Optional[str] = None
 	sample_rate: int = 16000
+	final_seq: Optional[int] = None
 
 
 class MeetingCueReq(BaseModel):
@@ -1021,6 +1052,8 @@ async def note_audio(payload: NoteAudioReq, auth: AuthContext = Depends(require_
 
 _MEETING_TTL = 4 * 3600          # session lifetime; a forgotten session self-expires
 _MEETING_MAX_CHARS = 200_000     # ~4h of dense speech; hard cap against runaways
+_MEETING_LOCK_TTL = 300          # covers transcription + durable note storage
+_MEETING_LOCK_WAIT = 90          # let /end wait for an active chunk transcription
 
 
 def _meeting_meta_key(uid: str, mid: str) -> str:
@@ -1031,8 +1064,27 @@ def _meeting_parts_key(uid: str, mid: str) -> str:
 	return f"glasses:meeting:{uid}:{mid}:parts"
 
 
+def _meeting_seen_seq_key(uid: str, mid: str) -> str:
+	"""Name the Redis set that prevents retried audio chunks from duplicating."""
+	return f"glasses:meeting:{uid}:{mid}:seen-seq"
+
+
+def _meeting_mutation_lock_key(uid: str, mid: str) -> str:
+	"""Name the Redis lock that keeps chunk append and final save in order."""
+	return f"glasses:meeting:{uid}:{mid}:mutation-lock"
+
+
+def _meeting_result_key(uid: str, mid: str) -> str:
+	"""Name the short-lived completion receipt returned for safe /end retries."""
+	return f"glasses:meeting:{uid}:{mid}:result"
+
+
 def _meeting_start(uid: str, title: Optional[str]) -> Dict[str, Any]:
-	"""Open a meeting session and return its id."""
+	"""Open a Redis-backed meeting for `uid` and return its new opaque id.
+
+	The optional `title` is saved in temporary metadata. This mutates Redis only;
+	the durable searchable note is created later by `_meeting_end`.
+	"""
 	client = get_sync_redis_client()
 	mid = secrets.token_urlsafe(9)
 	meta = {"title": (title or "").strip(), "started": int(time.time())}
@@ -1043,61 +1095,129 @@ def _meeting_start(uid: str, title: Optional[str]) -> Dict[str, Any]:
 def _meeting_append(uid: str, mid: str, pcm_b64: str, sample_rate: int, seq: int) -> Dict[str, Any]:
 	"""Transcribe one audio chunk and append it to the session transcript.
 
-	Returns the chunk's text so the lens can show a live tail. Unknown/expired
-	sessions 404 so the client knows to stop streaming.
+	`seq` is a client-stable retry id. This holds the meeting's Redis lock while
+	transcribing so `/meeting/end` cannot finish ahead of an active chunk, and it
+	records each sequence once so a lost HTTP response cannot duplicate speech.
+	Unknown/expired sessions return 404; provider failures leave Redis unchanged.
 	"""
 	client = get_sync_redis_client()
-	if not client.get(_meeting_meta_key(uid, mid)):
-		raise HTTPException(status_code=404, detail="Meeting session expired or unknown")
-	text = _transcribe_pcm(pcm_b64, sample_rate)
+	lock = client.lock(
+		_meeting_mutation_lock_key(uid, mid),
+		timeout=_MEETING_LOCK_TTL,
+		blocking_timeout=_MEETING_LOCK_WAIT,
+	)
+	with lock:
+		meta_key = _meeting_meta_key(uid, mid)
+		if not client.get(meta_key):
+			raise HTTPException(status_code=404, detail="Meeting session expired or unknown")
+
+		seen_key = _meeting_seen_seq_key(uid, mid)
+		if client.sismember(seen_key, str(seq)):
+			return {"text": "", "seq": seq, "duplicate": True}
+
+		text = _transcribe_pcm(pcm_b64, sample_rate)
+		if text:
+			# Save the text and retry marker together under the meeting lock so
+			# /end sees either the complete chunk or none of it.
+			parts_key = _meeting_parts_key(uid, mid)
+			client.rpush(parts_key, text)
+			client.sadd(seen_key, str(seq))
+			client.expire(parts_key, _MEETING_TTL)
+			client.expire(seen_key, _MEETING_TTL)
+			client.expire(meta_key, _MEETING_TTL)
+
+	# Cue generation stays outside the lock because it is best-effort and must
+	# never delay another chunk or the user's final save.
 	if text:
-		parts_key = _meeting_parts_key(uid, mid)
-		client.rpush(parts_key, text)
-		client.expire(parts_key, _MEETING_TTL)
-		client.expire(_meeting_meta_key(uid, mid), _MEETING_TTL)
-		# Enough new speech since the last cue? Kick off insight generation in
-		# the background — the chunk response must never wait on LLM/RAG work.
 		_maybe_trigger_cue(uid, mid)
-	return {"text": text, "seq": seq}
+	return {"text": text, "seq": seq, "duplicate": False}
 
 
-def _meeting_end(uid: str, mid: str, title: Optional[str], final_pcm_b64: Optional[str], sample_rate: int) -> Dict[str, Any]:
-	"""Assemble the transcript and store it as a parent note (+ chunk sync)."""
+def _meeting_end(
+	uid: str,
+	mid: str,
+	title: Optional[str],
+	final_pcm_b64: Optional[str],
+	sample_rate: int,
+	final_seq: Optional[int] = None,
+) -> Dict[str, Any]:
+	"""Finish one meeting and save its transcript as a searchable note.
+
+	`uid` and `mid` select the user's Redis session; `title` can override its
+	stored title, while `final_pcm_b64`/`final_seq` identify the last audio flush.
+	The meeting lock waits for active chunks and the completion receipt makes a
+	retried `/end` return the original note id. A failed durable write keeps the
+	session intact so the client can retry instead of losing the transcript.
+	"""
 	client = get_sync_redis_client()
-	meta_raw = client.get(_meeting_meta_key(uid, mid))
-	if not meta_raw:
-		raise HTTPException(status_code=404, detail="Meeting session expired or unknown")
-	meta = json.loads(meta_raw)
+	lock = client.lock(
+		_meeting_mutation_lock_key(uid, mid),
+		timeout=_MEETING_LOCK_TTL,
+		blocking_timeout=_MEETING_LOCK_WAIT,
+	)
+	with lock:
+		result_key = _meeting_result_key(uid, mid)
+		cached_result = client.get(result_key)
+		if cached_result:
+			return json.loads(cached_result)
 
-	# Flush the final partial chunk the client recorded before ending.
-	if final_pcm_b64:
-		try:
-			tail = _transcribe_pcm(final_pcm_b64, sample_rate)
-			if tail:
-				client.rpush(_meeting_parts_key(uid, mid), tail)
-		except HTTPException:
-			pass  # a bad final chunk must not lose the whole meeting
+		meta_raw = client.get(_meeting_meta_key(uid, mid))
+		if not meta_raw:
+			raise HTTPException(status_code=404, detail="Meeting session expired or unknown")
+		meta = json.loads(meta_raw)
 
-	parts = client.lrange(_meeting_parts_key(uid, mid), 0, -1) or []
-	transcript = "\n".join(p for p in parts if p).strip()[:_MEETING_MAX_CHARS]
+		# Flush the final partial chunk once. A stable `final_seq` means a lost
+		# /end response can be retried without transcribing or appending it twice.
+		seen_key = _meeting_seen_seq_key(uid, mid)
+		final_already_saved = (
+			final_seq is not None and client.sismember(seen_key, str(final_seq))
+		)
+		if final_pcm_b64 and not final_already_saved:
+			try:
+				tail = _transcribe_pcm(final_pcm_b64, sample_rate)
+				if tail:
+					client.rpush(_meeting_parts_key(uid, mid), tail)
+					if final_seq is not None:
+						client.sadd(seen_key, str(final_seq))
+			except HTTPException:
+				pass  # a bad final chunk must not lose the rest of the meeting
 
-	# Session cleanup regardless of outcome — it is finished either way.
+		parts = client.lrange(_meeting_parts_key(uid, mid), 0, -1) or []
+		transcript = "\n".join(p for p in parts if p).strip()[:_MEETING_MAX_CHARS]
+
+		if not transcript:
+			result = {"ok": False, "title": None, "uniqueid": None, "chars": 0}
+			client.set(result_key, json.dumps(result), ex=_MEETING_TTL)
+			_cleanup_meeting_session(client, uid, mid)
+			return result
+
+		started = datetime.fromtimestamp(int(meta.get("started") or time.time()), tz=timezone.utc)
+		note_title = (title or meta.get("title") or "").strip() or f"Meeting {started:%b %d %H:%M} UTC"
+		result = _store_note(uid, transcript, note_title)
+		result["chars"] = len(transcript)
+		if result.get("ok"):
+			# Store the receipt before cleanup so a client that lost the HTTP
+			# response gets the same note id instead of creating a duplicate.
+			client.set(result_key, json.dumps(result), ex=_MEETING_TTL)
+			_cleanup_meeting_session(client, uid, mid)
+		return result
+
+
+def _cleanup_meeting_session(client, uid: str, mid: str) -> None:
+	"""Remove one completed meeting's temporary transcript and Cue state.
+
+	`client` is the Redis connection mutated in place; `uid` and `mid` scope every
+	deleted key. Callers must first confirm the transcript is empty or durably
+	saved because this cleanup cannot recover meeting audio.
+	"""
 	client.delete(_meeting_meta_key(uid, mid))
 	client.delete(_meeting_parts_key(uid, mid))
+	client.delete(_meeting_seen_seq_key(uid, mid))
 	client.delete(
 		_cue_key(uid, mid), _cue_seq_key(uid, mid),
 		_cue_mark_key(uid, mid), _cue_lock_key(uid, mid),
 		_cue_hist_key(uid, mid),
 	)
-
-	if not transcript:
-		return {"ok": False, "title": None, "uniqueid": None, "chars": 0}
-
-	started = datetime.fromtimestamp(int(meta.get("started") or time.time()), tz=timezone.utc)
-	note_title = (title or meta.get("title") or "").strip() or f"Meeting {started:%b %d %H:%M} UTC"
-	result = _store_note(uid, transcript, note_title)
-	result["chars"] = len(transcript)
-	return result
 
 
 # --- Live AI cues during a meeting -------------------------------------------
@@ -1112,11 +1232,20 @@ def _meeting_end(uid: str, mid: str, title: Optional[str], final_pcm_b64: Option
 
 _CUE_MIN_WORDS = 20
 _CUE_MIN_SENTENCES = 3
-_CUE_CONTEXT_CHARS = 4000   # background conversation the planner/composer see;
+_CUE_CONTEXT_CHARS = 2000   # background conversation the planner/composer see;
                             # kept tight so stale topics can't outweigh the
-                            # newest speech (~10 min of talk)
-_CUE_MAX_LEN = 170          # lens-sized; the cue shares the display with the tail
+                            # newest speech (~5 min of talk)
+_CUE_MAX_LEN = 900          # the newest cue expands into its own card on the lens,
+                            # so give it room for a full multi-sentence, compound
+                            # explanation (not a fragment). The card shows what
+                            # fits; the rest is clipped rather than cut at gen time.
 _CUE_LOCK_TTL = 90          # generation lock; expires even if a worker dies
+_CUE_HISTORY = 5            # prior cues fed back so the thread builds forward
+
+# Models (OpenRouter). Planning stays on the small query-generation model, while
+# the user-visible Cue response uses Gemini Flash for fast live synthesis.
+_CUE_PLAN_MODEL = "openai/gpt-4.1-mini"
+_CUE_COMPOSE_MODEL = "google/gemini-3.6-flash"
 
 
 def _cue_key(uid: str, mid: str) -> str:
@@ -1190,20 +1319,23 @@ def _cue_plan(conversation: str, fresh: str) -> Dict[str, Any]:
 	"""
 	try:
 		resp = _get_openrouter_client().chat.completions.create(
-			model="openai/gpt-4.1-mini",
+			model=_CUE_PLAN_MODEL,
 			messages=[
 				{
 					"role": "system",
 					"content": (
-						"You plan lookups for a real-time meeting copilot. Given the newest "
-						"stretch of speech in a live meeting, output JSON:\n"
-						'{"memory_queries": [up to 3 short search queries over the user\'s '
-						"personal knowledge base — people, projects, decisions, numbers "
-						'mentioned], "web_query": "one web search query if a fresh external '
-						'fact would genuinely help, else null"}\n'
-						"All queries must be about the CURRENT topic — what was JUST said. "
-						"Earlier conversation is background only; if the speakers changed "
-						"subject, ignore the earlier topics completely."
+						"You plan lookups for a real-time meeting copilot that gives the "
+						"wearer an EDGE. Given the newest stretch of speech, first infer what "
+						"they are actually deciding or wrestling with, then output JSON:\n"
+						'{"memory_queries": [up to 3 short searches over the user\'s personal '
+						"knowledge base that would surface decision-relevant context: past "
+						"decisions on this, related numbers, prior positions, tensions or "
+						'commitments they may have forgotten], "web_query": "one web search '
+						'if an external fact would sharpen the call, else null"}\n'
+						"Aim the queries at what would reveal a blind spot or settle the "
+						"decision — not just the nouns mentioned. All queries must be about "
+						"the CURRENT topic (what was JUST said); if the subject changed, "
+						"ignore earlier topics entirely."
 					),
 				},
 				{
@@ -1327,9 +1459,9 @@ def _generate_cue(client, uid: str, mid: str) -> None:
 		[r for r in hop2_raw if r.get("uniqueid") not in hop1_ids], 3
 	)
 
-	# Stage 2: compose ONE insight — or decline. Declining is important: a bad
-	# cue on the lens mid-conversation is worse than none. Prior cues are shown
-	# so the composer never circles back to an angle it already surfaced.
+	# Stage 2: THINK, then compose one sharp cue — or decline. A bad cue mid-
+	# conversation is worse than none. Prior cues thread FORWARD: each new cue
+	# should go a step deeper than the last, not surface the same note again.
 	prior_cues = [c for c in (client.lrange(_cue_hist_key(uid, mid), 0, -1) or []) if c]
 	# Newest speech leads: the cue must be about the CURRENT topic, so the
 	# composer sees it first and history is explicitly demoted to background.
@@ -1338,44 +1470,110 @@ def _generate_cue(client, uid: str, mid: str) -> None:
 		f"EARLIER CONVERSATION (background only — topics here may be stale):\n{conversation}",
 	]
 	if prior_cues:
-		sections.append("CUES ALREADY SHOWN (do not repeat these ideas):\n" + "\n".join(f"- {c}" for c in prior_cues))
+		sections.append(
+			"INSIGHTS ALREADY GIVEN (build FORWARD from these — go deeper or to the "
+			"next step, never restate):\n" + "\n".join(f"- {c}" for c in prior_cues)
+		)
 	if memory_lines:
-		sections.append("FROM THE USER'S MEMORY:\n" + "\n".join(memory_lines))
+		sections.append("FROM THE USER'S MEMORY (raw material to reason over, not to parrot):\n" + "\n".join(memory_lines))
 	if related_lines:
 		sections.append("CONNECTED/RELATED NOTES (2nd hop):\n" + "\n".join(related_lines))
 	if web_lines:
 		sections.append("WEB RESULTS:\n" + "\n".join(web_lines))
 
 	resp = _get_openrouter_client().chat.completions.create(
-		model="openai/gpt-4.1-mini",
+		model=_CUE_COMPOSE_MODEL,
 		messages=[
 			{
 				"role": "system",
 				"content": (
-					"You are a live meeting copilot rendered on smart-glasses. From the "
-					"conversation and the research below, output ONE short INSIGHT the "
-					f"wearer would be glad to know right now: max {_CUE_MAX_LEN} characters, "
-					"plain text, no markdown, no emoji. An insight is a piece of "
-					"INFORMATION stated declaratively: a fact from their memory ('You "
-					"quoted Diane $2k/mo on Jun 3'), a connection ('This overlaps your "
-					"Lackey trial-gate notes'), a concrete fact from the web ('Limitless "
-					"charges $19/mo for unlimited'), or an implication of what was said. "
-					"NEVER coach the wearer — no 'ask if...', 'consider...', 'have you "
-					"thought about...', or suggestions of what to say. State information; "
-					"let them decide what to do with it. It must be about the CURRENT "
-					"topic — what was JUST said. If the conversation moved to a new "
-					"subject, earlier topics are off-limits, no matter how good the "
-					"research on them looks. Bring a NEW angle — never rephrase a cue "
-					"already shown. If you have no genuinely new information about the "
-					"current topic, output exactly NONE."
+					"You are a razor-sharp strategic advisor whispering to someone mid-"
+					"conversation through their smart glasses. You see the live talk, what "
+					"they just said, their own notes and memory, related material, and web "
+					"facts.\n\n"
+					"CRITICAL -- SYNTHESIS, NOT RECALL: The user already knows what is in "
+					"their own notes. Reading a memory back to them is useless. Their past "
+					"memories are raw FUEL, never the output. Your only job is to SYNTHESIZE: "
+					"fuse what they JUST said with one or more things from their memory (or "
+					"the web) to produce ONE conclusion they have NOT reached yet. The shape "
+					"is always: [something from their past] + [what is happening right now] = "
+					"[an edge they cannot see themselves]. If your cue could get the reply "
+					"'yeah, I know, that is in my notes', it has FAILED -- rewrite it into the "
+					"insight that follows FROM those notes.\n\n"
+					f"Output ONE cue, max {_CUE_MAX_LEN} characters, plain text, no markdown, "
+					"no emoji. It must be a NEW thought, doing at least one of these, "
+					"specific to the decision they are wrestling with right now:\n"
+					"- Connect the dots: tie what they are saying now to a past decision, "
+					"number, or tension so a non-obvious pattern pops ('You hit this exact "
+					"wall in the Q2 launch -- it was not pricing then either').\n"
+					"- Name a blind spot or non-obvious implication ('Your churn note blames "
+					"onboarding, not price -- this discount will not fix it').\n"
+					"- Point one concrete path forward their own history supports ('Ship the "
+					"half-day pilot first; your notes show full builds stall here').\n"
+					"- Deliver a decision-changing fact (memory or web) that flips the "
+					"current call.\n\n"
+					"Reason across the sources and LAND a conclusion. Never restate a note, "
+					"never say 'your note says' or echo a title -- draw the inference the "
+					"notes point to.\n\n"
+					"When you lack enough to make a confident call, ASK the one sharp "
+					"question that would unlock it -- the missing piece of data that would "
+					"change the decision ('What's the actual CAC? That decides if $10/mo "
+					"works'). Lean toward ending with a pointed question whenever a real "
+					"unknown is blocking a clear decision: good advisors ask more than they "
+					"assert. But the question must expose a genuine decision-relevant "
+					"unknown -- never generic coaching like 'have you considered...'.\n\n"
+					"Be concrete and specific to what they're deciding. Build FORWARD from "
+					"insights already given -- go deeper or to the next step, never restate. "
+					"Stay on the CURRENT topic; if the subject changed, older material is "
+					"off-limits.\n\n"
+					"FORMAT -- READ THIS TWICE: Write a MULTI-SENTENCE, COMPOUND explanation "
+					"(3 to 5 sentences) in plain, everyday language. Lay out the reasoning: "
+					"state the insight, connect it to the specific memory/fact it rests on, "
+					"explain WHY it matters for the decision right now, and end with the "
+					"concrete next step or the one sharp question that unlocks it. It must "
+					"stand on its own and fully explain itself -- a busy person reads it once "
+					"and gets the whole thought. NEVER output a cryptic fragment, an aphorism, "
+					"a headline, or a half-finished thought (e.g. 'full transcripts are a "
+					"graveyard' is BANNED -- it explains nothing). Say the actual insight and "
+					"the reasoning behind it, in real words. If you genuinely have nothing "
+					"sharp and new to add, output exactly NONE."
 				),
 			},
 			{"role": "user", "content": "\n\n".join(sections)[:14000]},
 		],
-		max_tokens=90,
-		temperature=0.4,
+		max_tokens=1200,
+		temperature=0.5,
 	)
 	cue_text = (resp.choices[0].message.content or "").strip()
+
+	# Log exactly what OpenRouter spent so we can see if reasoning/"thinking"
+	# tokens are eating the budget and truncating the visible cue. finish_reason
+	# == "length" means the model hit max_tokens (cut off); a big reasoning_tokens
+	# with small output chars means thinking ate the budget.
+	try:
+		_choice = resp.choices[0]
+		_usage = getattr(resp, "usage", None)
+		_finish = getattr(_choice, "finish_reason", None)
+		_prompt_tok = getattr(_usage, "prompt_tokens", None) if _usage else None
+		_completion_tok = getattr(_usage, "completion_tokens", None) if _usage else None
+		_total_tok = getattr(_usage, "total_tokens", None) if _usage else None
+		# Reasoning tokens live under completion_tokens_details on reasoning models.
+		_details = getattr(_usage, "completion_tokens_details", None) if _usage else None
+		_reasoning_tok = None
+		if _details is not None:
+			_reasoning_tok = getattr(_details, "reasoning_tokens", None)
+			if _reasoning_tok is None and isinstance(_details, dict):
+				_reasoning_tok = _details.get("reasoning_tokens")
+		print(
+			f"[glasses] cue compose usage model={_CUE_COMPOSE_MODEL} "
+			f"finish={_finish} prompt_tok={_prompt_tok} completion_tok={_completion_tok} "
+			f"reasoning_tok={_reasoning_tok} total_tok={_total_tok} "
+			f"out_chars={len(cue_text)} max_tokens=1200"
+		)
+		if _finish == "length":
+			print("[glasses] cue WARNING: hit max_tokens (finish_reason=length) -- output truncated")
+	except Exception as _e:
+		print(f"[glasses] cue usage log failed: {type(_e).__name__}: {_e}")
 
 	# Advance the mark even when declining, so the same words aren't re-analyzed;
 	# new speech re-arms the trigger naturally.
@@ -1395,10 +1593,10 @@ def _generate_cue(client, uid: str, mid: str) -> None:
 		json.dumps({"seq": seq, "text": cue_text, "ts": int(time.time())}),
 		ex=_MEETING_TTL,
 	)
-	# Remember what was shown (last 6) so later composer runs bring new angles.
+	# Remember what was shown so later cues thread forward from it (not repeat).
 	hist_key = _cue_hist_key(uid, mid)
 	client.rpush(hist_key, cue_text)
-	client.ltrim(hist_key, -6, -1)
+	client.ltrim(hist_key, -_CUE_HISTORY, -1)
 	client.expire(hist_key, _MEETING_TTL)
 	print(f"[glasses] cue #{seq} for {mid}: {cue_text}")
 
@@ -1416,9 +1614,24 @@ def _meeting_cue(uid: str, mid: str, after_seq: int) -> Dict[str, Any]:
 
 
 @router.post("/meeting/start")
-async def meeting_start(payload: MeetingStartReq, auth: AuthContext = Depends(require_auth)):
-	"""Open a meeting-transcription session."""
+async def meeting_start(
+	payload: MeetingStartReq,
+	request: Request,
+	auth: AuthContext = Depends(require_auth),
+):
+	"""Open a meeting-transcription session.
+
+	Logs the calling client's Origin so we can tell WHICH lens build is running:
+	the hosted app (Origin: https://www.constella.app, always latest) vs. a
+	packaged .ehpk (null/other origin, frozen at pack time). A stale package is
+	invisible server-side otherwise — it uploads chunks fine but never polls
+	/meeting/cue, so cues generate into the void.
+	"""
 	try:
+		print(
+			f"[glasses] meeting/start client origin={request.headers.get('origin')!r} "
+			f"ua={(request.headers.get('user-agent') or '')[:80]!r}"
+		)
 		return await asyncio.to_thread(_meeting_start, auth.sub, payload.title)
 	except HTTPException:
 		raise
@@ -1461,7 +1674,13 @@ async def meeting_end(payload: MeetingEndReq, auth: AuthContext = Depends(requir
 	"""Finalize a meeting: assemble transcript, store as searchable memory."""
 	try:
 		return await asyncio.to_thread(
-			_meeting_end, auth.sub, payload.meeting_id, payload.title, payload.pcm_base64, payload.sample_rate
+			_meeting_end,
+			auth.sub,
+			payload.meeting_id,
+			payload.title,
+			payload.pcm_base64,
+			payload.sample_rate,
+			payload.final_seq,
 		)
 	except HTTPException:
 		raise

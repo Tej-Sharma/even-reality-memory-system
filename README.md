@@ -48,8 +48,15 @@ Ask *"what did Diane say about the pilot?"* and you get a composed answer, not t
 
 ### 3. Meeting mode with live AI cues
 
-Start a meeting and the mic streams continuously. Every stretch of speech is transcribed and saved as one searchable note. **While you talk**, the backend quietly analyzes the conversation, searches your memory and its connections, checks the web when useful, and surfaces one sharp insight on the lens — no interaction needed.
+Start a meeting and the mic streams continuously in short chunks, so the transcript appears on the lens a few seconds after you speak (near-live). Every stretch of speech is transcribed and saved as one searchable note. **While you talk**, the backend quietly analyzes the conversation, searches your memory and its connections, checks the web when useful, and surfaces one sharp insight on the lens — no interaction needed.
 
+The insight shows up as its own bordered **cue card** (like Even's native Conversate cue, but powered by your own memory): the newest insight is expanded, older ones collapse into a list beneath it, a REC timer sits top-right, and the live transcript runs along the bottom. Tap the card to expand/collapse; double-tap to finish and save. Crucially the cues **synthesize** rather than recall — the model is told to fuse what you just said with your memory into a conclusion you haven't reached yet, not read your own notes back to you.
+
+<p align="center">
+  <img src="docs/images/cue-card.png" width="380" alt="Live AI cue card during a meeting">
+  &nbsp;
+  <img src="docs/images/cue-card-list.png" width="380" alt="Cue card collapsed with earlier cues listed">
+</p>
 <p align="center">
   <img src="docs/images/meeting-mode.png" width="300" alt="Meeting mode start">
   &nbsp;
@@ -82,7 +89,8 @@ Three pieces, and one important fact about the platform: **no code runs on the g
 | Path | What it is |
 |------|-----------|
 | `backend/glasses_router.py` | The whole backend: device-link login, speech-to-text, capture/ask routing, agent-loop recall, meeting transcription, and the live-cue engine. A FastAPI router. |
-| `lens-app/` | The app that runs on the glasses (TypeScript). State machine, mic capture with voice-activity detection, the Even Hub SDK wrapper, device-link login UI, and the meeting/cue UI. |
+| `backend/whisper_server.py` | Optional local GPU speech-to-text service (faster-whisper). Run it as its own single process so the model loads once, and the router calls it first (falling back to a cloud STT). Free per call, low latency, quota-proof. |
+| `lens-app/` | The app that runs on the glasses (TypeScript). State machine, mic capture with voice-activity detection, the Even Hub SDK wrapper, device-link login UI, and the meeting/cue-card UI. |
 | `package/` | Builds the `.ehpk` package you upload to the Even developer portal. |
 | `docs/images/` | The lens screenshots used in this README. |
 
@@ -91,6 +99,8 @@ Three pieces, and one important fact about the platform: **no code runs on the g
 - **Device-link login.** The glasses have no keyboard, so login works like a TV: the lens shows a short code + URL, you finish the email login on your phone, and the glasses poll until they get a token.
 - **Capture vs. ask routing is deterministic first, LLM second.** Explicit trigger words and question shapes are handled by rules; only genuinely ambiguous utterances hit a small model. Ambiguity defaults to *saving*, because a misfiled note is recoverable and a lost thought is not.
 - **Live cues never block recording.** Cue generation (plan → RAG → follow connections → optional web search → compose one insight, or decline) runs in a background thread behind a lock. The lens just polls for the newest one. A bad cue mid-conversation is worse than none, so the model is told to stay silent when it has nothing genuinely useful.
+- **Cues synthesize, they don't recall.** Each cue sees the fresh speech + a tight window of recent conversation + the last few cues (so it threads forward instead of repeating). The prompt's core rule: *past memory + what's happening now = an edge you can't see yourself.* If the cue could get the reply "yeah, I know, that's in my notes", it failed.
+- **Transcription can run on your own GPU.** `whisper_server.py` is a single-process faster-whisper service; the router tries it first and falls back to a cloud STT. Because it's free per call, meeting chunks are kept short for a near-live transcript, and its voice-activity filter also strips the "thank you for watching"-style hallucinations Whisper emits on silence.
 - **Everything is sized for a tiny green display.** Answers are clamped to plain text, no markdown, no emoji, a few hundred characters.
 
 ---
@@ -126,6 +136,8 @@ cd package
 - The Even app **fires every utterance twice**, so capture needs a short dedupe window.
 - Hub apps are **foreground-only**: keep the Even app open on the phone during use.
 - The SDK creates its bridge globals on import, so detect the real WebView with the host-injected handle, not the SDK's own globals.
+- Multi-container pages (used for the cue card + REC badge + transcript strip) go through `rebuildPageContainer`, which **never throws** — on any validation failure it silently returns `false` and leaves the old page up. Two rules that will silently reject a layout: **exactly one** container per page may have `isEventCapture: 1`, and `borderRadius` maxes at **10** (borderColor is 0–15 greyscale; use a high value for a visible border). Log the boolean return while building layouts.
+- `audioControl()` never throws either — mic denial is a silent `false` you must check.
 
 ---
 

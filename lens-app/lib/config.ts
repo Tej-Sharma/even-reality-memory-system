@@ -24,12 +24,13 @@ export const VAD_MAX_WAIT_FOR_SPEECH_MS = 6000;
 export const VAD_MIN_RECORD_MS = 700;
 
 // --- Meeting mode ---
-// Upload cadence for continuous transcription. ~25s of 16kHz s16le PCM is
-// ~800KB raw (~1.1MB base64) per chunk — fine over the phone's connection.
-export const MEETING_CHUNK_MS = 25_000;
+// Upload cadence for continuous transcription. Short chunks = near-live
+// transcript (words appear a few seconds after they're spoken). Transcription
+// now runs on our own GPU (whisper-server) so each call is free — cheap to go
+// fast. ~4s of 16kHz s16le PCM is ~128KB raw, trivial over the phone link.
+export const MEETING_CHUNK_MS = 4_000;
 // Hard ceiling on one meeting session (backend session TTL is 4h).
 export const MEETING_MAX_MS = 3 * 60 * 60 * 1000;
-// How often the lens polls for a new live AI cue while recording. The server
-// generates at most ~one cue per chunk (~25s), so 7s keeps the lens fresh
-// without hammering the API.
-export const MEETING_CUE_POLL_MS = 7000;
+// How often the lens polls for a new live AI cue while recording. Kept tight so
+// a fresh insight lands on the card quickly after enough new speech accrues.
+export const MEETING_CUE_POLL_MS = 4000;

@@ -19,6 +19,7 @@ import {
   AudioInputSource,
   CreateStartUpPageContainer,
   OsEventTypeList,
+  RebuildPageContainer,
   TextContainerProperty,
   TextContainerUpgrade,
   waitForEvenAppBridge,
@@ -36,6 +37,7 @@ import {
 // Bridge shape and lean on the concrete classes imported above for calls.
 export interface Bridge {
   createStartUpPageContainer(arg: any): Promise<number>;
+  rebuildPageContainer(arg: any): Promise<boolean>;
   textContainerUpgrade(arg: any): Promise<any>;
   shutDownPageContainer(mode: number): Promise<any>;
   audioControl(on: boolean, source?: any): Promise<boolean>;
@@ -48,6 +50,18 @@ export type InputKind = 'tap' | 'double' | 'up' | 'down' | 'exit';
 
 const CONTAINER_ID = 1;
 const CONTAINER_NAME = 'main';
+// Meeting mode uses a second, bordered container at the bottom as a floating
+// "AI cue" card (like Even's native Conversate cue), separate from the
+// transcript. Container 1 becomes the transcript, container 2 is the card.
+const CUE_CONTAINER_ID = 2;
+const CUE_CONTAINER_NAME = 'cue';
+// Small "REC m:ss" badge pinned to the top-right corner during a meeting.
+const REC_CONTAINER_ID = 3;
+const REC_CONTAINER_NAME = 'rec';
+// In the meeting HUD, container 1 is reused as the bottom transcript strip.
+const TRANSCRIPT_CONTAINER_ID = CONTAINER_ID;
+// Exposed so app.ts can tell a tap on the cue card apart from other taps.
+export const MEETING_CUE_CONTAINER_ID = CUE_CONTAINER_ID;
 
 let bridge: Bridge | null = null;
 let recording = false;
@@ -97,7 +111,10 @@ export async function initGlasses(initialText: string): Promise<Bridge> {
   if (result !== 0) {
     // 1=invalid params, 2=oversize, 3=out of memory. Audio control is only
     // available AFTER a successful startup page, so surface this loudly.
-    console.error('[glasses] createStartUpPageContainer failed with code', result);
+    console.error(
+      '[glasses] createStartUpPageContainer failed with code',
+      result
+    );
     lastEventSummary = `startup page failed: code ${result}`;
   }
   return bridge;
@@ -109,7 +126,9 @@ export async function render(text: string): Promise<void> {
   if (!bridge) return;
   let content = (text || '').slice(0, 800);
   if (debugEnabled) {
-    content += `\n--\ndbg ev:${lastEventSummary || 'none'} chunks:${chunkCount}`;
+    content += `\n--\ndbg ev:${
+      lastEventSummary || 'none'
+    } chunks:${chunkCount}`;
   }
   await withTimeout(
     bridge.textContainerUpgrade(
@@ -117,6 +136,165 @@ export async function render(text: string): Promise<void> {
         containerID: CONTAINER_ID,
         containerName: CONTAINER_NAME,
         content,
+      })
+    ),
+    3000,
+    false
+  );
+}
+
+/** Switch the lens to the meeting HUD: a running AI-cue LIST fills the top (the
+ *  newest insight expanded, older ones collapsed below it), a small "REC m:ss"
+ *  badge sits top-right, and a thin live-transcript strip runs along the bottom.
+ *  Uses rebuildPageContainer, which the SDK documents as the way to change the
+ *  page after the initial startup page. Returns true only if the host accepted
+ *  the rebuild; the caller falls back to the single-container inline layout when
+ *  it returns false, so meeting mode never breaks. */
+export async function enterMeetingLayout(
+  cueList: string,
+  transcript: string,
+  rec: string
+): Promise<boolean> {
+  if (!bridge?.rebuildPageContainer) {
+    lastEventSummary = 'hud:no-rebuild-method';
+    return false;
+  }
+  // REC badge, top-right corner.
+  const recC = new TextContainerProperty({
+    xPosition: 392,
+    yPosition: 6,
+    width: 180,
+    height: 26,
+    borderWidth: 0,
+    paddingLength: 4,
+    containerID: REC_CONTAINER_ID,
+    containerName: REC_CONTAINER_NAME,
+    content: (rec || '').slice(0, 60),
+    isEventCapture: 0,
+  });
+  // Cue list — the star of the screen, drawn as a bordered rectangle CARD.
+  // Newest expanded, older collapsed. This is the ONE event-capture container
+  // on the page (the SDK requires exactly one): tap = expand, double = finish.
+  const cueC = new TextContainerProperty({
+    xPosition: 8,
+    yPosition: 36,
+    width: 560,
+    height: 198,
+    borderWidth: 2,
+    borderColor: 14, // 0-15 greyscale; high = clearly visible green border
+    borderRadius: 10, // max allowed is 10
+    paddingLength: 10,
+    containerID: CUE_CONTAINER_ID,
+    containerName: CUE_CONTAINER_NAME,
+    content: (cueList || '').slice(0, 900),
+    isEventCapture: 1, // the single capture container for the whole page
+  });
+  // Thin live-transcript strip along the bottom (display only — not capturing;
+  // the SDK allows only one isEventCapture container and the card owns it).
+  const transcriptC = new TextContainerProperty({
+    xPosition: 8,
+    yPosition: 242,
+    width: 560,
+    height: 42,
+    borderWidth: 0,
+    paddingLength: 4,
+    containerID: TRANSCRIPT_CONTAINER_ID,
+    containerName: 'transcript',
+    content: (transcript || '').slice(0, 400),
+    isEventCapture: 0,
+  });
+  // Do NOT gate on the resolved value: hosts signal success inconsistently
+  // (createStartUpPageContainer uses 0=success, rebuild's boolean may resolve as
+  // 0/undefined/late). Treat the HUD as active unless the call actually throws;
+  // that's what kept the card from ever showing (it fell back to ">>").
+  try {
+    const res = await withTimeout(
+      bridge.rebuildPageContainer(
+        new RebuildPageContainer({
+          containerTotalNum: 3,
+          textObject: [cueC, transcriptC, recC],
+        })
+      ),
+      3000,
+      false
+    );
+    // rebuild returns true on success; false = SDK validation rejected it (it
+    // does not throw), which leaves the old page up. Surface that so we see it.
+    lastEventSummary = `hud:rebuild->${JSON.stringify(res)}`;
+    return res === true;
+  } catch (e) {
+    lastEventSummary = `hud:threw ${e instanceof Error ? e.message : String(e)}`.slice(0, 80);
+    console.error('[glasses] rebuildPageContainer threw', e);
+    return false;
+  }
+}
+
+/** Tear the meeting HUD back down to the single full-screen container so the
+ *  normal screens (result, home, etc.) render correctly again. */
+export async function exitMeetingLayout(text: string): Promise<void> {
+  if (!bridge?.rebuildPageContainer) return;
+  const main = new TextContainerProperty({
+    xPosition: 0,
+    yPosition: 0,
+    width: 576,
+    height: 288,
+    borderWidth: 0,
+    paddingLength: 6,
+    containerID: CONTAINER_ID,
+    containerName: CONTAINER_NAME,
+    content: (text || '').slice(0, 800),
+    isEventCapture: 1,
+  });
+  await withTimeout(
+    bridge.rebuildPageContainer(
+      new RebuildPageContainer({ containerTotalNum: 1, textObject: [main] })
+    ),
+    3000,
+    false
+  );
+}
+
+/** Update ONLY the cue-list container (2), leaving transcript + REC untouched. */
+export async function renderCueList(text: string): Promise<void> {
+  if (!bridge) return;
+  await withTimeout(
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: CUE_CONTAINER_ID,
+        containerName: CUE_CONTAINER_NAME,
+        content: (text || '').slice(0, 900),
+      })
+    ),
+    3000,
+    false
+  );
+}
+
+/** Update ONLY the REC badge (container 3). */
+export async function renderRec(text: string): Promise<void> {
+  if (!bridge) return;
+  await withTimeout(
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: REC_CONTAINER_ID,
+        containerName: REC_CONTAINER_NAME,
+        content: (text || '').slice(0, 60),
+      })
+    ),
+    3000,
+    false
+  );
+}
+
+/** Update ONLY the bottom transcript strip (container 1). */
+export async function renderTranscript(text: string): Promise<void> {
+  if (!bridge) return;
+  await withTimeout(
+    bridge.textContainerUpgrade(
+      new TextContainerUpgrade({
+        containerID: TRANSCRIPT_CONTAINER_ID,
+        containerName: 'transcript',
+        content: (text || '').slice(0, 400),
       })
     ),
     3000,
@@ -136,7 +314,9 @@ export async function exitApp(): Promise<void> {
 
 /** Subscribe to touchpad/ring input, normalized to InputKind. Audio frames are
  *  siphoned off here too while recording (same event channel). */
-export function onInput(handler: (kind: InputKind) => void): void {
+export function onInput(
+  handler: (kind: InputKind, containerId?: number) => void
+): void {
   bridge?.onEvenHubEvent((event: any) => {
     // --- Audio branch first: PCM frames flow through this same channel ---
     const audio = event?.audioEvent;
@@ -158,21 +338,26 @@ export function onInput(handler: (kind: InputKind) => void): void {
     const src = event?.textEvent ?? event?.listEvent ?? event?.sysEvent;
     if (!src) return;
     const type = Number(src.eventType ?? 0);
-    lastEventSummary = `${event?.textEvent ? 'text' : event?.listEvent ? 'list' : 'sys'}:${type}`;
+    // Which container the event came from (used to route a tap on the cue card
+    // vs. the transcript). Undefined on sysEvent / simulator.
+    const cid = src.containerID != null ? Number(src.containerID) : undefined;
+    lastEventSummary = `${
+      event?.textEvent ? 'text' : event?.listEvent ? 'list' : 'sys'
+    }:${type}:c${cid ?? '?'}`;
     console.log('[glasses] input event', lastEventSummary, src);
 
     switch (type) {
       case OsEventTypeList.CLICK_EVENT: // 0
-        handler('tap');
+        handler('tap', cid);
         break;
       case OsEventTypeList.DOUBLE_CLICK_EVENT: // 3
-        handler('double');
+        handler('double', cid);
         break;
       case OsEventTypeList.SCROLL_TOP_EVENT: // 1
-        handler('up');
+        handler('up', cid);
         break;
       case OsEventTypeList.SCROLL_BOTTOM_EVENT: // 2
-        handler('down');
+        handler('down', cid);
         break;
       case OsEventTypeList.ABNORMAL_EXIT_EVENT: // 6
       case OsEventTypeList.SYSTEM_EXIT_EVENT: // 7
@@ -226,7 +411,9 @@ function trackVoiceActivity(chunk: Uint8Array): void {
 /** Start capturing from the glasses mic. Returns true when the host actually
  *  opened the mic — a silent `false` is the documented denial path.
  *  `onAutoStop` fires once when VAD detects the utterance has ended. */
-export async function startRecording(onAutoStop?: () => void): Promise<boolean> {
+export async function startRecording(
+  onAutoStop?: () => void
+): Promise<boolean> {
   if (!bridge || recording) return recording;
   audioChunks = [];
   chunkCount = 0;
@@ -293,7 +480,17 @@ export function drainRecordingBuffer(): Uint8Array {
 }
 
 /** Encode raw PCM bytes for upload (exposed for meeting-mode chunking). */
-export const pcmToBase64 = (bytes: Uint8Array) => (bytes.length ? u8ToBase64(bytes) : '');
+export const pcmToBase64 = (bytes: Uint8Array) =>
+  bytes.length ? u8ToBase64(bytes) : '';
+
+/** Decode stopped meeting audio so it can join any failed raw upload batches. */
+export function pcmFromBase64(value: string): Uint8Array {
+  if (!value) return new Uint8Array();
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
 
 // Normalize a host audioPcm payload (Uint8Array | number[] | base64 string) to bytes.
 // SDK 0.0.11 already normalizes to Uint8Array, but keep the fallbacks for safety.

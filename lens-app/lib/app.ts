@@ -29,13 +29,20 @@ import {
 import {
   type InputKind,
   drainRecordingBuffer,
+  enterMeetingLayout,
   exitApp,
+  exitMeetingLayout,
   getChunkCount,
+  getLastEventSummary,
   initGlasses,
   isRecording,
   onInput,
+  pcmFromBase64,
   pcmToBase64,
   render,
+  renderCueList,
+  renderRec,
+  renderTranscript,
   sampleRate,
   setDebug,
   startRecording,
@@ -58,14 +65,22 @@ let meetingStartedAt = 0;
 let meetingSeq = 0;
 let meetingTail = '';
 let meetingPending: Uint8Array[] = [];
-let meetingUploading = false;
+let meetingUploadPromise: Promise<void> | null = null;
 let meetingChunkTimer: ReturnType<typeof setInterval> | null = null;
 let meetingTickTimer: ReturnType<typeof setInterval> | null = null;
-// Live AI cue shown on the lens (latest one wins; stays until replaced).
-let meetingCueText = '';
+// Live AI cues shown on the lens. Newest is expanded at the top; older ones
+// collapse into a list below it. meetingCues[0] is the most recent.
+let meetingCues: string[] = [];
 let meetingCueSeq = 0;
 let meetingCueBusy = false;
+// Whether the newest cue's card is expanded (full text) or collapsed (preview).
+// A new cue auto-expands; tapping the card toggles it.
+let meetingCueExpanded = true;
 let meetingCueTimer: ReturnType<typeof setInterval> | null = null;
+// True once the two-pane meeting layout (transcript + bordered cue card) is
+// live. False = host rejected the rebuild, so we fall back to the single
+// container with the cue inlined as ">> ..." text.
+let meetingTwoPane = false;
 
 function homeScreen(): string {
   if (view === 'meeting') {
@@ -98,7 +113,9 @@ async function goIdle() {
 async function beginRecording() {
   phase = 'recording';
   // Feedback FIRST — if the mic fails we still want the screen to react to the tap.
-  await render('Listening...\n\nJust stop talking when done\n(or tap to stop).');
+  await render(
+    'Listening...\n\nJust stop talking when done\n(or tap to stop).'
+  );
   // VAD fires finishRecording after trailing silence — that's the "no second tap".
   const ok = await startRecording(() => void finishRecording());
   if (!ok) {
@@ -171,15 +188,51 @@ function meetingElapsed(): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
+/** One collapsed list line: strip newlines and clip to keep it single-line. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** Build the cue-list text: newest insight expanded at the top, older ones
+ *  collapsed into a short list beneath it (most recent first). */
+function formatCueList(): string {
+  if (!meetingCues.length) return 'Listening for insights...';
+  const [newest, ...older] = meetingCues;
+  // Newest card: full text when expanded, a one-line preview when collapsed.
+  let out = meetingCueExpanded
+    ? newest
+    : `${oneLine(newest, 90)}\n(tap card to expand)`;
+  if (older.length) {
+    const items = older
+      .slice(0, 4)
+      .map((c) => `• ${oneLine(c, 58)}`)
+      .join('\n');
+    out += `\n\n— earlier —\n${items}`;
+  }
+  return out;
+}
+
 async function renderMeetingScreen() {
-  // With a live cue the cue owns the middle of the lens and the transcript
-  // tail shrinks to one line; without one, the tail gets the space.
+  // Meeting HUD: cue list up top (its own container), REC badge top-right, live
+  // transcript along the bottom. Each is its own container so a new cue never
+  // reflows the transcript and vice-versa.
+  if (meetingTwoPane) {
+    const tail = meetingTail ? `...${meetingTail.slice(-140)}` : '(listening)';
+    await renderRec(`● REC  ${meetingElapsed()}`);
+    await renderCueList(formatCueList());
+    await renderTranscript(`${tail}   ·   Tap card: expand   ·   Double-tap: save`);
+    return;
+  }
+  // Fallback (single container): newest cue inline above a longer transcript.
+  // Surface WHY the card HUD is off so we can diagnose on-device without ?debug.
+  const newest = meetingCues[0] || '';
   const tail = meetingTail
-    ? `...${meetingTail.slice(meetingCueText ? -80 : -180)}`
+    ? `...${meetingTail.slice(newest ? -80 : -180)}`
     : '(listening)';
-  const cueBlock = meetingCueText ? `>> ${meetingCueText}\n\n` : '';
+  const cueBlock = newest ? `>> ${newest}\n\n` : '';
   await render(
-    `Recording meeting  ${meetingElapsed()}\n\n${cueBlock}${tail}\n\nTap: finish & save`
+    `Recording meeting  ${meetingElapsed()}\n\n${cueBlock}${tail}\n\n[${getLastEventSummary()}]\nTap: finish & save`
   );
 }
 
@@ -192,8 +245,14 @@ async function pollMeetingCue() {
     const res = await meetingCue(meetingId, meetingCueSeq);
     if (res.cue && res.cue.seq > meetingCueSeq) {
       meetingCueSeq = res.cue.seq;
-      meetingCueText = res.cue.text;
-      void renderMeetingScreen();
+      // Newest goes to the front and auto-expands; the previous one collapses
+      // into the list below it.
+      meetingCues.unshift(res.cue.text);
+      if (meetingCues.length > 8) meetingCues.length = 8;
+      meetingCueExpanded = true; // a fresh insight always opens expanded
+      // Touch only the cue-list container so the transcript doesn't reflow.
+      if (meetingTwoPane) void renderCueList(formatCueList());
+      else void renderMeetingScreen();
     }
   } catch {
     /* cue polling is best-effort; recording carries on */
@@ -218,24 +277,30 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 async function uploadMeetingChunk() {
   const fresh = drainRecordingBuffer();
   if (fresh.length) meetingPending.push(fresh);
-  if (meetingUploading || !meetingPending.length || !meetingId) return;
-  meetingUploading = true;
+  if (meetingUploadPromise || !meetingPending.length || !meetingId) {
+    return meetingUploadPromise;
+  }
   const batch = meetingPending;
   meetingPending = [];
-  try {
-    const res = await meetingChunk(
-      meetingId,
-      pcmToBase64(concatBytes(batch)),
-      sampleRate(),
-      meetingSeq++
-    );
-    if (res.text) meetingTail = res.text;
-    void renderMeetingScreen();
-  } catch {
-    meetingPending.unshift(...batch); // retry on the next tick
-  } finally {
-    meetingUploading = false;
-  }
+  const seq = meetingSeq;
+  meetingUploadPromise = (async () => {
+    try {
+      const res = await meetingChunk(
+        meetingId,
+        pcmToBase64(concatBytes(batch)),
+        sampleRate(),
+        seq
+      );
+      meetingSeq = seq + 1;
+      if (res.text) meetingTail = res.text;
+      if (phase === 'meeting') void renderMeetingScreen();
+    } catch {
+      meetingPending.unshift(...batch); // retry with the same seq on the next tick
+    } finally {
+      meetingUploadPromise = null;
+    }
+  })();
+  return meetingUploadPromise;
 }
 
 async function beginMeeting() {
@@ -246,7 +311,10 @@ async function beginMeeting() {
     meetingId = meeting_id;
   } catch (e) {
     phase = 'result';
-    const detail = e instanceof ApiError ? `Error ${e.status}: ${e.message}`.slice(0, 120) : 'Network error.';
+    const detail =
+      e instanceof ApiError
+        ? `Error ${e.status}: ${e.message}`.slice(0, 120)
+        : 'Network error.';
     await render(`Couldn't start meeting.\n${detail}\n\nTap to continue.`);
     return;
   }
@@ -254,18 +322,35 @@ async function beginMeeting() {
   if (!ok) {
     meetingId = '';
     phase = 'result';
-    await render('Mic unavailable.\n\nCheck glasses are worn +\nconnected, then tap to retry.');
+    await render(
+      'Mic unavailable.\n\nCheck glasses are worn +\nconnected, then tap to retry.'
+    );
     return;
   }
   meetingStartedAt = Date.now();
   meetingSeq = 0;
   meetingTail = '';
   meetingPending = [];
-  meetingCueText = '';
+  meetingCues = [];
   meetingCueSeq = 0;
+  meetingCueExpanded = true;
   phase = 'meeting';
-  meetingChunkTimer = setInterval(() => void uploadMeetingChunk(), MEETING_CHUNK_MS);
-  meetingCueTimer = setInterval(() => void pollMeetingCue(), MEETING_CUE_POLL_MS);
+  // Switch to the meeting HUD (cue list + REC badge + transcript strip). If the
+  // host rejects the rebuild, meetingTwoPane stays false and we fall back to the
+  // single-container inline cue layout.
+  meetingTwoPane = await enterMeetingLayout(
+    'Listening for insights...',
+    '(listening)   ·   Tap card: expand   ·   Double-tap: save',
+    '● REC  0:00'
+  );
+  meetingChunkTimer = setInterval(
+    () => void uploadMeetingChunk(),
+    MEETING_CHUNK_MS
+  );
+  meetingCueTimer = setInterval(
+    () => void pollMeetingCue(),
+    MEETING_CUE_POLL_MS
+  );
   meetingTickTimer = setInterval(() => {
     if (Date.now() - meetingStartedAt > MEETING_MAX_MS) {
       void finishMeeting(); // hard cap
@@ -276,6 +361,10 @@ async function beginMeeting() {
   await renderMeetingScreen();
 }
 
+/** Stop recording and durably finalize the current meeting.
+ *  This clears timers/Cue state, waits for `meetingUploadPromise`, retries any
+ *  pending audio with its stable sequence, and changes `phase` to the result
+ *  screen. The backend keeps the same note receipt safe across request retries. */
 async function finishMeeting() {
   if (phase !== 'meeting') return;
   phase = 'busy';
@@ -283,32 +372,61 @@ async function finishMeeting() {
   if (meetingTickTimer) clearInterval(meetingTickTimer);
   if (meetingCueTimer) clearInterval(meetingCueTimer);
   meetingChunkTimer = meetingTickTimer = meetingCueTimer = null;
-  meetingCueText = '';
+  meetingCues = [];
   meetingCueSeq = 0;
-  await render('Saving meeting...');
+  // Collapse the meeting HUD back to one full container so the result and later
+  // screens render normally.
+  if (meetingTwoPane) {
+    await exitMeetingLayout('Saving meeting...');
+    meetingTwoPane = false;
+  } else {
+    await render('Saving meeting...');
+  }
 
-  // Everything still buffered (mic + failed uploads) rides along with /end.
-  meetingPending.push(drainRecordingBuffer());
-  await stopRecording(); // buffer already drained; this just closes the mic
+  // Wait for the active upload, then retry any failed batch with its same
+  // sequence id so /end cannot overtake it or save duplicate transcript text.
+  if (meetingUploadPromise) await meetingUploadPromise;
+  await uploadMeetingChunk();
+
+  // Stop the mic before assembling the final flush so frames arriving during
+  // shutdown join any failed upload batch instead of disappearing.
+  const stoppedPcm = await stopRecording();
+  if (stoppedPcm) meetingPending.push(pcmFromBase64(stoppedPcm));
   const finalPcm = pcmToBase64(concatBytes(meetingPending));
   meetingPending = [];
   const id = meetingId;
-  meetingId = '';
+  const finalSeq = meetingSeq;
   try {
-    const res = await meetingEnd(id, finalPcm || undefined, sampleRate());
+    const res = await meetingEnd(
+      id,
+      finalPcm || undefined,
+      sampleRate(),
+      undefined,
+      finalSeq
+    );
+    meetingId = '';
+    // Show the real count: raw chars under 1k (so a short meeting never reads
+    // "0k"), otherwise a 1-decimal "k" figure.
+    const chars = res.chars || 0;
+    const charsLabel =
+      chars < 1000 ? `${chars} chars` : `${(chars / 1000).toFixed(1)}k chars`;
     await render(
       res.ok
-        ? `Meeting saved.\n${res.title || ''}\n(${Math.round((res.chars || 0) / 1000)}k chars)\n\nAsk me about it anytime.`
+        ? `Meeting saved.\n${res.title || ''}\n(${charsLabel})\n\nAsk me about it anytime.`
         : 'Nothing captured.\nTap to continue.'
     );
   } catch (e) {
-    const detail = e instanceof ApiError ? `Error ${e.status}: ${e.message}`.slice(0, 120) : 'Network error.';
+    meetingId = '';
+    const detail =
+      e instanceof ApiError
+        ? `Error ${e.status}: ${e.message}`.slice(0, 120)
+        : 'Network error.';
     await render(`Couldn't save meeting.\n${detail}\n\nTap to continue.`);
   }
   phase = 'result';
 }
 
-function handleInput(kind: InputKind) {
+function handleInput(kind: InputKind, containerId?: number) {
   // Host teardown (system/abnormal exit): flush what we can, release the mic.
   if (kind === 'exit') {
     if (phase === 'meeting') {
@@ -331,7 +449,8 @@ function handleInput(kind: InputKind) {
   }
 
   if (kind === 'up' || kind === 'down') {
-    if (phase === 'recording' || phase === 'busy' || phase === 'meeting') return;
+    if (phase === 'recording' || phase === 'busy' || phase === 'meeting')
+      return;
     view = view === 'quick' ? 'meeting' : 'quick';
     void saveView(view); // boot lands on the last-used view next launch
     void goIdle();
@@ -348,7 +467,15 @@ function handleInput(kind: InputKind) {
       void finishRecording(); // early stop — VAD would have gotten there anyway
       break;
     case 'meeting':
-      void finishMeeting();
+      // In the HUD the cue card is the sole tap-capture container, so a single
+      // tap toggles expand/collapse and DOUBLE-tap finishes (handled above). In
+      // the single-container fallback there's no card, so a tap finishes.
+      if (meetingTwoPane) {
+        meetingCueExpanded = !meetingCueExpanded;
+        void renderCueList(formatCueList());
+      } else {
+        void finishMeeting();
+      }
       break;
     case 'result':
       void goIdle();
@@ -410,13 +537,47 @@ async function runDemoMode(): Promise<void> {
   });
 }
 
+/** Static demo of the live meeting HUD (cue card + REC badge + transcript) with
+ *  sample data and NO backend/auth — used to capture store screenshots of the
+ *  AI-cue feature. Tapping the card toggles expand/collapse like the real app. */
+async function runCueDemo(): Promise<void> {
+  await initGlasses('Constella');
+  meetingCues = [
+    'Your Q2 retention note pins churn on onboarding friction, not price, so ' +
+      "the discount you're weighing won't move the needle. Ship the guided-setup " +
+      'pilot you sketched in March first, then re-test pricing. What is day-1 ' +
+      'activation right now? That decides which lever actually matters.',
+    'Pricing tests here stalled twice before, both on positioning not cost.',
+    'Diane flagged this same enterprise blocker in the Linear thread Tuesday.',
+  ];
+  meetingCueExpanded = true;
+  meetingTwoPane = await enterMeetingLayout(
+    formatCueList(),
+    '...so if we drop it to ten a month, does that actually fix the churn or',
+    '● REC  12:47'
+  );
+  // If the host rejects the rebuild, at least paint the fallback so the screen
+  // isn't blank during capture.
+  if (!meetingTwoPane) await render(`>> ${meetingCues[0]}`);
+  onInput((kind) => {
+    if (kind !== 'tap') return;
+    meetingCueExpanded = !meetingCueExpanded;
+    void renderCueList(formatCueList());
+  });
+}
+
 /** Boot the glasses app. Safe to call multiple times; only the first runs. */
 export async function startGlassesApp(): Promise<void> {
   if (bootStarted) return;
   bootStarted = true;
   try {
     try {
-      if (new URLSearchParams(window.location.search).get('demo') === '1') {
+      const demoParam = new URLSearchParams(window.location.search).get('demo');
+      if (demoParam === 'cue') {
+        await runCueDemo();
+        return;
+      }
+      if (demoParam === '1') {
         await runDemoMode();
         return;
       }
